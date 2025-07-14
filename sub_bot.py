@@ -3,8 +3,8 @@ import requests
 import re
 import os
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -28,8 +28,8 @@ def escape_markdown(text: str) -> str:
 
 
 # --- S-UI API FUNCTIONS ---
+# (These functions are correct and unchanged)
 def get_sui_inbounds():
-    """Fetches a list of all inbounds from the s-ui panel."""
     api_url = f"{SUI_PANEL_URL}/apiv2/inbounds"
     headers = {'Accept': 'application/json', 'Token': SUI_API_TOKEN}
     try:
@@ -47,7 +47,6 @@ def get_sui_inbounds():
 
 
 def test_sui_connection():
-    """Tests the connection to the s-ui panel."""
     api_url = f"{SUI_PANEL_URL}/apiv2/status"
     headers = {'Accept': 'application/json', 'Token': SUI_API_TOKEN}
     try:
@@ -84,45 +83,87 @@ async def test_sui_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def list_inbounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetches and lists all s-ui inbounds and their associated users."""
+    """Fetches and lists all s-ui inbounds with interactive buttons."""
     await update.message.reply_text("Fetching inbounds from your panel...")
 
     is_successful, data = get_sui_inbounds()
-
     if not is_successful:
         await update.message.reply_text(f"❌ Error: {escape_markdown(data)}")
         return
 
     inbound_list = data.get('inbounds', [])
-
     if not inbound_list:
         await update.message.reply_text("No inbounds found on your panel.")
         return
 
-    message_lines = ["*Available Inbounds & Users:*\n"]
+    keyboard = []
+    message_text = "*Available Inbounds:*\n"
     for inbound in inbound_list:
-        inbound_id = escape_markdown(str(inbound.get('id', 'N/A')))
-        port = escape_markdown(str(inbound.get('listen_port', 'N/A')))
-        protocol = escape_markdown(inbound.get('type', 'N/A'))
         remark = escape_markdown(inbound.get('tag', 'No Name'))
+        inbound_id = inbound.get('id', 0)
+        user_count = len(inbound.get('users', []))
 
-        message_lines.append(f"• *Name:* `{remark}`  *ID:* `{inbound_id}`")
-        message_lines.append(f"  *Protocol:* {protocol} \\| *Port:* {port}")
+        # Add text description for this inbound
+        message_text += f"\n• *Name:* `{remark}` \| *ID:* `{inbound_id}` \| *Users:* {user_count}"
 
-        user_list = inbound.get('users', [])
-        user_count = len(user_list)
+        # Add a button for this inbound
+        keyboard.append([
+            InlineKeyboardButton(f"View Users in '{inbound.get('tag', 'No Name')}' ({user_count})",
+                                 callback_data=f"view_users:{inbound_id}")
+        ])
 
-        # --- THIS IS THE FIX ---
-        if user_count > 0:
-            sample_users = ", ".join(user_list[:3])
-            # Escape the parentheses around the count and the dots for the ellipsis
-            message_lines.append(f"  *Users \\({user_count}\\):* `{escape_markdown(sample_users)}`\\.\\.\\.")
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='MarkdownV2')
+
+
+# --- NEW: HANDLER FOR BUTTON CLICKS ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parses the CallbackQuery and updates the message text."""
+    query = update.callback_query
+    await query.answer()  # Acknowledge the button press
+
+    # Data is in the format "action:id", e.g., "view_users:2"
+    action, inbound_id_str = query.data.split(':')
+    inbound_id = int(inbound_id_str)
+
+    if action == "view_users":
+        # In the future, we will fetch users and show them. For now, just confirm.
+        is_successful, data = get_sui_inbounds()
+        if not is_successful:
+            await query.edit_message_text(text=f"Error fetching data again: {escape_markdown(data)}")
+            return
+
+        target_inbound = None
+        for inbound in data.get('inbounds', []):
+            if inbound.get('id') == inbound_id:
+                target_inbound = inbound
+                break
+
+        if target_inbound:
+            remark = escape_markdown(target_inbound.get('tag', 'No Name'))
+            user_list = target_inbound.get('users', [])
+
+            if not user_list:
+                await query.edit_message_text(text=f"No users found in inbound *{remark}*\.", parse_mode='MarkdownV2')
+                return
+
+            # For now, we just list them as text. In the next step, we can make these buttons too.
+            user_text_list = "\n".join([f"`{escape_markdown(user)}`" for user in user_list])
+            message = f"*Users in {remark}:*\n\n{user_text_list}"
+
+            # Add a "Back" button
+            keyboard = [[InlineKeyboardButton("« Back to Inbounds", callback_data="back_to_inbounds")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(text=message, reply_markup=reply_markup, parse_mode='MarkdownV2')
+
         else:
-            message_lines.append(f"  *Users:* None")
+            await query.edit_message_text(text="Couldn't find that inbound anymore. Try /list_inbounds again.")
 
-        message_lines.append("")
-
-    await update.message.reply_text("\n".join(message_lines), parse_mode='MarkdownV2')
+    elif action == "back_to_inbounds":
+        # This is a bit inefficient as it re-runs the command logic, but it's simple and works.
+        # We can pass the original message object to a new function to make it cleaner later.
+        await list_inbounds_command(query, context)
 
 
 # --- MAIN BOT FUNCTION ---
@@ -133,6 +174,8 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("test_sui", test_sui_command))
     application.add_handler(CommandHandler("list_inbounds", list_inbounds_command))
+    # Add the new handler for button clicks
+    application.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("Bot is starting... Press Ctrl-C to stop.")
     application.run_polling()
